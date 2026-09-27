@@ -10,6 +10,7 @@ import {
   requireAuth,
   verifyPassword
 } from '../../lib/auth.js';
+import { writeEvent } from '../../lib/events.js';
 
 const credentialsSchema = z.object({
   email: z.string().trim().email('请输入有效邮箱').max(320),
@@ -128,17 +129,59 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     if (!(await verifyPassword(user.passwordHash, parsed.data.password))) {
       throw new AppError(422, 'INVALID_PASSWORD', '密码不正确');
     }
+    const userId = authUser.id;
+    // 注销与数据清理共用同一时间戳：账号、书目、痕迹、完成感受在同一时刻进入软删除，
+    // 保留期与彻底清理任务据此按同一条时间线处理。
     const now = new Date();
-    await prisma.$transaction([
-      prisma.session.updateMany({
-        where: { userId: authUser.id, revokedAt: null },
-        data: { revokedAt: now }
-      }),
-      prisma.user.update({
-        where: { id: authUser.id },
+    await prisma.$transaction(async (tx) => {
+      const [books, dogEars, annotations, rereadMarks, reflections] = await Promise.all([
+        tx.book.findMany({ where: { userId, deletedAt: null }, select: { id: true, title: true } }),
+        tx.dogEar.findMany({ where: { userId, deletedAt: null }, select: { id: true, bookId: true } }),
+        tx.annotation.findMany({ where: { userId, deletedAt: null }, select: { id: true, bookId: true } }),
+        tx.rereadMark.findMany({ where: { userId, deletedAt: null }, select: { id: true, bookId: true } }),
+        tx.completionReflection.findMany({ where: { userId, deletedAt: null }, select: { id: true, bookId: true } })
+      ]);
+      const softDelete = { deletedAt: now, version: { increment: 1 } };
+      await Promise.all([
+        tx.dogEar.updateMany({ where: { userId, deletedAt: null }, data: softDelete }),
+        tx.annotation.updateMany({ where: { userId, deletedAt: null }, data: softDelete }),
+        tx.rereadMark.updateMany({ where: { userId, deletedAt: null }, data: softDelete }),
+        tx.completionReflection.updateMany({ where: { userId, deletedAt: null }, data: softDelete }),
+        tx.book.updateMany({ where: { userId, deletedAt: null }, data: softDelete }),
+        tx.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: now } })
+      ]);
+      // 为每个被清理的对象补写删除事件，保证恢复审计完整。
+      for (const book of books) {
+        await writeEvent(tx, {
+          userId,
+          bookId: book.id,
+          entityType: 'BOOK',
+          entityId: book.id,
+          action: 'DELETED',
+          payload: { bookTitle: book.title, reason: 'account_deleted' }
+        });
+      }
+      const childEvents = [
+        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, ...item })),
+        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, ...item })),
+        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, ...item })),
+        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, ...item }))
+      ];
+      for (const child of childEvents) {
+        await writeEvent(tx, {
+          userId,
+          bookId: child.bookId,
+          entityType: child.entityType,
+          entityId: child.id,
+          action: 'DELETED',
+          payload: { cascade: true, reason: 'account_deleted' }
+        });
+      }
+      await tx.user.update({
+        where: { id: userId },
         data: { status: 'DELETED', deletedAt: now }
-      })
-    ]);
+      });
+    });
     reply.clearCookie('pbt_session', { path: '/' });
     return reply.status(204).send();
   });
