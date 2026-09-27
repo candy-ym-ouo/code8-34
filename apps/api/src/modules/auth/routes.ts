@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
+import { writeEvent } from '../../lib/events.js';
 import {
   createSession,
   currentUser,
@@ -129,16 +130,119 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(422, 'INVALID_PASSWORD', '密码不正确');
     }
     const now = new Date();
-    await prisma.$transaction([
-      prisma.session.updateMany({
-        where: { userId: authUser.id, revokedAt: null },
-        data: { revokedAt: now }
-      }),
-      prisma.user.update({
+    await prisma.$transaction(async (tx) => {
+      // 只处理仍有效的对象：注销前已软删的对象保留各自的 deletedAt，
+      // 使其保留窗口与后续彻底清理仍按原有时间线计算；
+      // 本次级联删除的所有对象统一使用同一个 now，与用户注销时刻对齐。
+      const [books, dogEars, annotations, rereadMarks, reflections] = await Promise.all([
+        tx.book.findMany({
+          where: { userId: authUser.id, deletedAt: null },
+          select: { id: true, title: true }
+        }),
+        tx.dogEar.findMany({
+          where: { userId: authUser.id, deletedAt: null },
+          select: { id: true, bookId: true, pageNumber: true }
+        }),
+        tx.annotation.findMany({
+          where: { userId: authUser.id, deletedAt: null },
+          select: { id: true, bookId: true, startPage: true, endPage: true }
+        }),
+        tx.rereadMark.findMany({
+          where: { userId: authUser.id, deletedAt: null },
+          select: { id: true, bookId: true, pageNumber: true }
+        }),
+        tx.completionReflection.findMany({
+          where: { userId: authUser.id, deletedAt: null },
+          select: { id: true, bookId: true, completionRound: true }
+        })
+      ]);
+
+      // 先删除子对象再删除书目，全部与用户注销使用同一时间戳。
+      await Promise.all([
+        tx.dogEar.updateMany({
+          where: { userId: authUser.id, deletedAt: null },
+          data: { deletedAt: now, version: { increment: 1 } }
+        }),
+        tx.annotation.updateMany({
+          where: { userId: authUser.id, deletedAt: null },
+          data: { deletedAt: now, version: { increment: 1 } }
+        }),
+        tx.rereadMark.updateMany({
+          where: { userId: authUser.id, deletedAt: null },
+          data: { deletedAt: now, version: { increment: 1 } }
+        }),
+        tx.completionReflection.updateMany({
+          where: { userId: authUser.id, deletedAt: null },
+          data: { deletedAt: now, version: { increment: 1 } }
+        }),
+        tx.book.updateMany({
+          where: { userId: authUser.id, deletedAt: null },
+          data: { deletedAt: now, version: { increment: 1 } }
+        }),
+        tx.session.updateMany({
+          where: { userId: authUser.id, revokedAt: null },
+          data: { revokedAt: now }
+        })
+      ]);
+
+      await tx.user.update({
         where: { id: authUser.id },
         data: { status: 'DELETED', deletedAt: now }
-      })
-    ]);
+      });
+
+      // 审计与恢复所需的时间线不随软删除回抹：为每个被级联的对象写 DELETED 事件。
+      for (const book of books) {
+        await writeEvent(tx, {
+          userId: authUser.id,
+          bookId: book.id,
+          entityType: 'BOOK',
+          entityId: book.id,
+          action: 'DELETED',
+          payload: { bookTitle: book.title, reason: 'account_deleted' }
+        });
+      }
+      const childEvents = [
+        ...dogEars.map((item) => ({
+          entityType: 'DOG_EAR' as const,
+          id: item.id,
+          bookId: item.bookId,
+          payload: { pageNumber: item.pageNumber, cascade: true, reason: 'account_deleted' }
+        })),
+        ...annotations.map((item) => ({
+          entityType: 'ANNOTATION' as const,
+          id: item.id,
+          bookId: item.bookId,
+          payload: {
+            startPage: item.startPage,
+            endPage: item.endPage,
+            cascade: true,
+            reason: 'account_deleted'
+          }
+        })),
+        ...rereadMarks.map((item) => ({
+          entityType: 'REREAD_MARK' as const,
+          id: item.id,
+          bookId: item.bookId,
+          payload: { pageNumber: item.pageNumber, cascade: true, reason: 'account_deleted' }
+        })),
+        ...reflections.map((item) => ({
+          entityType: 'COMPLETION_REFLECTION' as const,
+          id: item.id,
+          bookId: item.bookId,
+          payload: { completionRound: item.completionRound, cascade: true, reason: 'account_deleted' }
+        }))
+      ];
+      for (const child of childEvents) {
+        await writeEvent(tx, {
+          userId: authUser.id,
+          bookId: child.bookId,
+          entityType: child.entityType,
+          entityId: child.id,
+          action: 'DELETED',
+          payload: child.payload
+        });
+      }
+    });
     reply.clearCookie('pbt_session', { path: '/' });
     return reply.status(204).send();
   });
